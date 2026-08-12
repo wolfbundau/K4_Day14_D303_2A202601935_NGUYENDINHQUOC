@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -19,6 +20,11 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
@@ -242,28 +248,108 @@ class TextGenerator(Protocol):
     def generate(self, prompt: str) -> str: ...
 
 
+def _extract_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response.strip()
+    if isinstance(response, dict):
+        if response.get("output_text"):
+            return str(response["output_text"]).strip()
+        if response.get("choices"):
+            choice = response["choices"][0]
+            if isinstance(choice, dict):
+                msg = choice.get("message", {})
+                if isinstance(msg, dict) and msg.get("content"):
+                    return str(msg["content"]).strip()
+                if choice.get("text"):
+                    return str(choice["text"]).strip()
+    if hasattr(response, "output_text") and getattr(response, "output_text", None):
+        return str(response.output_text).strip()
+    if hasattr(response, "choices"):
+        choices = getattr(response, "choices")
+        if choices:
+            choice = choices[0]
+            if hasattr(choice, "message") and getattr(choice.message, "content", None):
+                return str(choice.message.content).strip()
+            if hasattr(choice, "text") and getattr(choice, "text", None):
+                return str(choice.text).strip()
+    return str(response).strip()
+
+
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip()
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+            
+        self.client = OpenAI(**client_kwargs)
         self.max_output_tokens = max_output_tokens
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        max_retries = 6
+        base_delay = 10.0
+
+        for attempt in range(max_retries):
+            try:
+                answer = ""
+                try:
+                    response = self.client.responses.create(
+                        model=self.model,
+                        input=prompt,
+                        temperature=0,
+                        max_output_tokens=self.max_output_tokens,
+                    )
+                    answer = _extract_text(response)
+                except Exception:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=self.max_output_tokens,
+                    )
+                    answer = _extract_text(response)
+
+                if answer.lower().startswith(("<!doctype html", "<html")):
+                    raise RuntimeError(
+                        "API endpoint returned an HTML login/redirect page instead of an LLM completion response. "
+                        "Please verify your OPENAI_API_KEY and OPENAI_BASE_URL in .env."
+                    )
+
+                if not answer:
+                    raise RuntimeError("LLM returned an empty answer")
+
+                time.sleep(2)
+                return answer
+
+            except Exception as err:
+                err_msg = str(err)
+                is_rate_limit = any(
+                    k in err_msg.lower()
+                    for k in ["429", "quota", "rate", "retrydelay", "resource_exhausted", "too many requests"]
+                )
+                if is_rate_limit and attempt < max_retries - 1:
+                    match = re.search(r"retryDelay':\s*'(\d+)s'", err_msg)
+                    if match:
+                        sleep_time = int(match.group(1)) + 3
+                    else:
+                        sleep_time = int(base_delay * (1.5 ** attempt))
+                    print(f" [Rate limit 429 / FreeTier Quota] Pausing {sleep_time}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(sleep_time)
+                else:
+                    raise RuntimeError(f"Failed to generate completion from LLM: {err}") from err
+
+        raise RuntimeError("Failed to generate completion after maximum retries")
+
+
+
+
 
 
 @dataclass(frozen=True)
